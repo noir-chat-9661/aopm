@@ -299,6 +299,9 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	if o.Plan && strings.HasPrefix(first, "/") && !strings.Contains(first[1:], "/") {
 		return backendResult{}, fmt.Errorf("plan mode refuses slash-command prompts")
 	}
+	if o.Plan {
+		o.Sandbox = "read-only"
+	}
 	args := []string{o.Binary, "--print-timeout", fmt.Sprintf("%ds", o.Timeout), "--sandbox", "--settings", antigravitySettings(o.Sandbox)}
 	if o.Plan {
 		args = append(args, "--mode", "plan")
@@ -350,10 +353,14 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 		return backendResult{}, fmt.Errorf("agy produced no JSON result containing response")
 	}
 	answer := responseText(obj)
+	denied := string(obj["denied_actions"])
+	if denied == "null" || denied == "[]" {
+		denied = ""
+	}
 	if strings.TrimSpace(answer) == "" {
-		if denied := string(obj["denied_actions"]); denied != "" && denied != "null" && denied != "[]" {
+		if denied != "" {
 			// agyは拒否された時点で終わる。それまでの編集は残るので、再開できるようセッションを返す。
-			return backendResult{Session: rawString(obj["conversation_id"])}, fmt.Errorf("agy stopped: the sandbox=%q policy denied %s; earlier edits remain, use antigravity_continue to resume without that action", o.Sandbox, denied)
+			return backendResult{Session: rawString(obj["conversation_id"])}, fmt.Errorf("agy stopped: the sandbox=%q policy denied %s; any earlier edits remain, use antigravity_continue to resume without that action", o.Sandbox, denied)
 		}
 		return backendResult{}, fmt.Errorf("agy produced an empty response")
 	}
@@ -367,6 +374,8 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 			return backendResult{}, fmt.Errorf("agy returned invalid structured_output")
 		}
 		answer = b.String()
+	} else if denied != "" {
+		answer += fmt.Sprintf("\nWarning: the sandbox=%q policy denied %s; the task may be incomplete.", o.Sandbox, denied)
 	}
 	return backendResult{Answer: answer, Session: rawString(obj["conversation_id"])}, nil
 }

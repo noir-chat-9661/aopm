@@ -23,7 +23,7 @@ if [ "$FAKE_MODE" = "big" ]; then head -c 33554433 /dev/zero; exit 0; fi
 if [ "$FAKE_MODE" = "fail" ]; then printf '%2048s\n' error >&2; exit 7; fi
 if [ "$FAKE_MODE" = "sleep" ]; then (sleep 30) & echo $! > "$FAKE_CHILD"; wait; fi
 case "$FAKE_KIND" in
-antigravity) if [ "$FAKE_MODE" = denied ]; then printf '%s\n' '{"conversation_id":"agy-2","status":"SUCCESS","response":"","denied_actions":[{"action":"command"}]}'; exit 0; fi; printf '%s\n' '{"conversation_id":"agy-1","status":"SUCCESS","response":"ok"}' ;;
+antigravity) if [ "$FAKE_MODE" = denied ]; then printf '{"conversation_id":"agy-2","status":"SUCCESS","response":"%s","denied_actions":[{"action":"command"}]}\n' "$FAKE_RESPONSE"; exit 0; fi; printf '%s\n' '{"conversation_id":"agy-1","status":"SUCCESS","response":"ok"}' ;;
 codex) printf '%s\n' '{"type":"thread.started","thread_id":"codex-1"}' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}' '{"type":"turn.completed"}' ;;
 copilot) printf 'ok\n' ;;
 claude) printf '%s\n' '{"result":"ok","is_error":false,"session_id":"claude-1","subtype":"success"}' ;;
@@ -330,14 +330,14 @@ func TestAntigravityPolicy(t *testing.T) {
 		if err := json.Unmarshal([]byte(antigravitySettings(sandbox)), &s); err != nil {
 			t.Fatal(err)
 		}
-		deny := strings.Join(s.Permissions.Deny, " ")
+		deny := " " + strings.Join(s.Permissions.Deny, " ")
 		if s.AgentMode == nil || *s.AgentMode != "" || s.ToolPermission != "proceed-in-sandbox" || s.AllowNonWorkspaceAccess == nil || *s.AllowNonWorkspaceAccess {
 			t.Fatalf("%q: %+v", sandbox, s)
 		}
-		if !strings.Contains(deny, "mcp(*)") || !strings.Contains(deny, "unsandboxed(*)") {
+		if !strings.Contains(deny, " mcp(*)") || !strings.Contains(deny, " unsandboxed(*)") {
 			t.Fatalf("%q: escape routes open: %s", sandbox, deny)
 		}
-		if strings.Contains(deny, "write_file(*)") == wantWrite || strings.Contains(deny, " command(*)") == wantWrite {
+		if strings.Contains(deny, " write_file(*)") == wantWrite || strings.Contains(deny, " command(*)") == wantWrite {
 			t.Fatalf("%q: %s", sandbox, deny)
 		}
 	}
@@ -355,6 +355,24 @@ func TestAntigravityPolicy(t *testing.T) {
 	}
 	if p, _, err := loadSession("antigravity", ws); err != nil || p.Session != "agy-2" || p.Sandbox != "workspace-write" {
 		t.Fatalf("%+v %v", p, err)
+	}
+	t.Setenv("FAKE_RESPONSE", "partial")
+	logPath := filepath.Join(t.TempDir(), "argv")
+	t.Setenv("FAKE_LOG", logPath)
+	// planと既定は読み取り専用で、編集の自動承認を付けない。
+	for _, extra := range []map[string]any{{}, {"plan": true, "sandbox": "workspace-write"}} {
+		extra["prompt"], extra["workspace"] = "x", ws
+		answer, err := executeTool(context.Background(), "antigravity_ask", callJSON(t, extra))
+		if err != nil || !strings.Contains(answer, "partial") || !strings.Contains(answer, "policy denied") {
+			t.Fatalf("%q %v", answer, err)
+		}
+	}
+	argv, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(argv), "accept-edits") || strings.Contains(string(argv), "[Sandbox:") || strings.Count(string(argv), antigravitySettings("read-only")) != 2 {
+		t.Fatalf("argv: %s", argv)
 	}
 	// サンドボックス対応前に保存された記録は read-only として再開する。
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
