@@ -84,11 +84,9 @@ func toolDefinitions() []map[string]any {
 				properties["model"] = map[string]any{"type": "string"}
 				properties["timeout_s"] = map[string]any{"type": "integer", "default": defaultTimeout, "minimum": 1, "maximum": 7200}
 				required = []string{"prompt", "workspace"}
-				if b != "antigravity" {
-					properties["sandbox"] = map[string]any{"type": "string", "enum": []string{"read-only", "workspace-write"}}
-					if action == "ask" {
-						properties["sandbox"].(map[string]any)["default"] = "read-only"
-					}
+				properties["sandbox"] = map[string]any{"type": "string", "enum": []string{"read-only", "workspace-write"}}
+				if action == "ask" {
+					properties["sandbox"].(map[string]any)["default"] = "read-only"
 				}
 				switch b {
 				case "codex":
@@ -120,7 +118,7 @@ func toolDescription(backend, action string) string {
 		return "Check the installed " + backend + " CLI and authentication without using model quota."
 	}
 	detail := map[string]string{
-		"antigravity": "Antigravity/Gemini; no sandbox, so it may write outside workspace.",
+		"antigravity": "Antigravity/Gemini; read-only runs no shell commands (include any diff in the prompt), workspace-write runs them in an OS sandbox.",
 		"codex":       "OpenAI Codex with a real OS sandbox (MCP servers in the codex config run outside it).",
 		"copilot":     "GitHub Copilot with agent-enforced permissions.",
 		"claude":      "Claude Code with agent-enforced permissions.",
@@ -142,10 +140,7 @@ func parseToolArgs(name string, raw json.RawMessage) (callArgs, error) {
 	if !ok {
 		return a, fmt.Errorf("unknown tool: %s", name)
 	}
-	allowed := map[string]bool{"prompt": true, "workspace": true, "model": true, "timeout_s": true, "watch": true}
-	if backend != "antigravity" {
-		allowed["sandbox"] = true
-	}
+	allowed := map[string]bool{"prompt": true, "workspace": true, "model": true, "timeout_s": true, "sandbox": true, "watch": true}
 	if backend != "opencode" {
 		allowed["effort"] = true
 	}
@@ -216,14 +211,12 @@ func parseToolArgs(name string, raw json.RawMessage) (callArgs, error) {
 	if a.Timeout < 1 || a.Timeout > 7200 {
 		return a, fmt.Errorf("timeout_s must be between 1 and 7200")
 	}
-	if backend != "antigravity" {
-		if v, ok := fields["sandbox"]; ok && !omitted(v) {
-			var mode string
-			if json.Unmarshal(v, &mode) != nil || (mode != "read-only" && mode != "workspace-write") {
-				return a, fmt.Errorf("sandbox must be read-only or workspace-write")
-			}
-			a.Sandbox = &mode
+	if v, ok := fields["sandbox"]; ok && !omitted(v) {
+		var mode string
+		if json.Unmarshal(v, &mode) != nil || (mode != "read-only" && mode != "workspace-write") {
+			return a, fmt.Errorf("sandbox must be read-only or workspace-write")
 		}
+		a.Sandbox = &mode
 	}
 	if backend == "antigravity" {
 		if v, ok := fields["plan"]; ok && !omitted(v) {
@@ -389,15 +382,15 @@ func executeTool(ctx context.Context, name string, raw json.RawMessage) (string,
 			return "", fmt.Errorf("no saved %s session for this workspace; call %s_ask first", backend, backend)
 		}
 	}
-	sandbox := "none"
-	if backend != "antigravity" {
+	sandbox := "read-only"
+	if action == "continue" {
+		sandbox = pin.Sandbox
+	}
+	if a.Sandbox != nil {
+		sandbox = *a.Sandbox
+	}
+	if a.Plan {
 		sandbox = "read-only"
-		if action == "continue" && a.Sandbox == nil {
-			sandbox = pin.Sandbox
-		}
-		if a.Sandbox != nil {
-			sandbox = *a.Sandbox
-		}
 	}
 	bin, err := resolveBackendBinary(backend)
 	if err != nil {
@@ -415,6 +408,11 @@ func executeTool(ctx context.Context, name string, raw json.RawMessage) (string,
 	}
 	r, err := runBackend(ctx, runOptions{Backend: backend, Binary: bin, Prompt: a.Prompt, Workspace: workspace, Model: a.Model, Sandbox: sandbox, Effort: a.Effort, Timeout: a.Timeout, Continue: action == "continue", Session: session, Plan: a.Plan, Schema: a.Schema})
 	if err != nil {
+		if r.Session != "" && ctx.Err() == nil {
+			if saveErr := saveSession(backend, workspace, sessionPin{Session: r.Session, Sandbox: sandbox}); saveErr != nil {
+				err = fmt.Errorf("%w (could not persist the session: %v)", err, saveErr)
+			}
+		}
 		return "", err
 	}
 	if r.Session == "" {
