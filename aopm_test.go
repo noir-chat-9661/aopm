@@ -1377,7 +1377,10 @@ func TestReviewFixItems(t *testing.T) {
 			{
 				Name: "antigravity", Installed: true, VersionDone: true, Version: "1.5.16",
 				AuthDone: true, Auth: "logged in", QuotaDone: true,
-				Meters: []quotaMeter{{Group: "Gemini Models", Window: "5h", Left: 76, Reset: now.Add(32 * time.Minute)}},
+				Meters: []quotaMeter{
+					{Group: "Gemini Models", Window: "5h", Left: 76, Reset: now.Add(32 * time.Minute)},
+					{Group: "Gemini Models", Window: "weekly", Left: 94, Reset: now.Add((6*24 + 19) * time.Hour)},
+				},
 			},
 			{
 				Name: "copilot", Installed: true, VersionDone: true, Version: "1.0.114",
@@ -1394,14 +1397,21 @@ func TestReviewFixItems(t *testing.T) {
 				}
 			}
 		}
-		// 幅40ではバーが縮むこと、幅32ではバーが省かれて%とリセットが残ること
-		out40 := renderStatuses(statuses, statusRenderOpts{Now: now, JA: true, Width: 40})
-		if !strings.Contains(out40, "█") || strings.Contains(out40, strings.Repeat("█", 15)) {
-			t.Fatalf("width 40 should shrink bar:\n%s", out40)
+		// 幅45では全meter行が同じバー幅(5..19)で揃うこと
+		out45 := renderStatuses(statuses, statusRenderOpts{Now: now, JA: true, Width: 45})
+		barRE := regexp.MustCompile(`[█░]+`)
+		bars := barRE.FindAllString(out45, -1)
+		if len(bars) != 2 || len([]rune(bars[0])) != len([]rune(bars[1])) || len([]rune(bars[0])) >= 20 || len([]rune(bars[0])) < 5 {
+			t.Fatalf("width 45 bars should match and shrink (5..19): %v\n%s", bars, out45)
 		}
+		// 幅32ではバーが省かれ、同じ省略方針で%位置が揃うこと
 		out32 := renderStatuses(statuses, statusRenderOpts{Now: now, JA: true, Width: 32})
-		if strings.Contains(out32, "█") || !strings.Contains(out32, "76%") || !strings.Contains(out32, "あと 32分") {
-			t.Fatalf("width 32 should omit bar and keep %% + reset:\n%s", out32)
+		if strings.Contains(out32, "█") || !strings.Contains(out32, "76%") || !strings.Contains(out32, "94%") {
+			t.Fatalf("width 32 should omit bar and keep %%:\n%s", out32)
+		}
+		lines32 := strings.Split(out32, "\n")
+		if displayWidth(strings.Split(lines32[1], "%")[0]) != displayWidth(strings.Split(lines32[2], "%")[0]) {
+			t.Fatalf("width 32 %% columns misaligned:\n%s", out32)
 		}
 	})
 

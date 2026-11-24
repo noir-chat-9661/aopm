@@ -369,18 +369,90 @@ func renderStatuses(statuses []backendStatus, opts statusRenderOpts) string {
 		winW = 12
 	}
 
-	blocks := make([]string, 0, len(statuses))
-	for _, st := range statuses {
-		blocks = append(blocks, renderBackendBlock(st, winW, opts))
-	}
-	return strings.Join(blocks, "\n\n") + "\n"
-}
-
-func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) string {
 	maxW := opts.Width
 	if maxW <= 0 || maxW > statusMaxWidth {
 		maxW = statusMaxWidth
 	}
+	ml := computeMeterLayout(statuses, winW, maxW, opts)
+
+	blocks := make([]string, 0, len(statuses))
+	for _, st := range statuses {
+		blocks = append(blocks, renderBackendBlock(st, ml, maxW, opts))
+	}
+	return strings.Join(blocks, "\n\n") + "\n"
+}
+
+type meterLayout struct {
+	compactPrefix bool
+	groupW        int
+	winW          int
+	barW          int
+	pctFmt        string
+	remGap        int
+	showRem       bool
+}
+
+func computeMeterLayout(statuses []backendStatus, winW, maxW int, opts statusRenderOpts) meterLayout {
+	maxRemW, maxGroupW := 0, 0
+	for _, st := range statuses {
+		for _, m := range st.Meters {
+			if w := displayWidth(formatRemaining(m.Reset, m.ResetText, opts.Now, opts.JA)); w > maxRemW {
+				maxRemW = w
+			}
+			if g := translateGroup(m.Group, opts.JA); g != "" {
+				if gw := displayWidth(g); gw > maxGroupW {
+					maxGroupW = gw
+				}
+			}
+		}
+	}
+	if maxGroupW > 6 {
+		maxGroupW = 6
+	}
+
+	leftW := 3 + 10 + winW + 2
+	remNeed := 0
+	if maxRemW > 0 {
+		remNeed = 3 + maxRemW
+	}
+	if availBar := maxW - leftW - 6 - remNeed; availBar >= 5 {
+		if availBar > 20 {
+			availBar = 20
+		}
+		return meterLayout{winW: winW, barW: availBar, pctFmt: "  %3d%%", remGap: 3, showRem: maxRemW > 0}
+	}
+
+	if maxRemW > 0 {
+		for _, opt := range []struct {
+			pctFmt string
+			pctW   int
+			gap    int
+		}{
+			{"  %3d%%", 6, 3},
+			{"  %3d%%", 6, 1},
+			{" %3d%%", 5, 1},
+		} {
+			if leftW+opt.pctW+opt.gap+maxRemW <= maxW {
+				return meterLayout{winW: winW, pctFmt: opt.pctFmt, remGap: opt.gap, showRem: true}
+			}
+		}
+	}
+	if leftW+6 <= maxW {
+		return meterLayout{winW: winW, pctFmt: "  %3d%%"}
+	}
+	if leftW+5 <= maxW {
+		return meterLayout{winW: winW, pctFmt: " %3d%%"}
+	}
+
+	cLeftW := 1 + winW
+	if maxGroupW > 0 {
+		cLeftW += maxGroupW + 1
+	}
+	showRem := maxRemW > 0 && cLeftW+5+1+maxRemW <= maxW
+	return meterLayout{compactPrefix: true, groupW: maxGroupW, winW: winW, pctFmt: " %3d%%", remGap: 1, showRem: showRem}
+}
+
+func renderBackendBlock(st backendStatus, ml meterLayout, maxW int, opts statusRenderOpts) string {
 	name := displayBackendName(st.Name)
 	nameCol := " " + padRightWidth(name, 10)
 
@@ -459,81 +531,44 @@ func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) strin
 			gLabel = translateGroup(m.Group, opts.JA)
 		}
 		prevGroup = m.Group
-		lines = append(lines, renderMeterLine(m, gLabel, winW, maxW, opts))
+		lines = append(lines, renderMeterLine(m, gLabel, ml, maxW, opts))
 	}
 	return strings.Join(lines, "\n")
 }
 
-func renderMeterLine(m quotaMeter, gLabel string, winW, maxW int, opts statusRenderOpts) string {
-	groupCol := padRightWidth(truncateWidth(gLabel, 9), 10)
-	winCol := padRightWidth(truncateWidth(translateWindow(m.Window, opts.JA), winW), winW) + "  "
-	leftCol := "   " + groupCol + winCol
-	leftW := displayWidth(leftCol)
-
-	pctPlain := fmt.Sprintf("  %3d%%", m.Left)
-	pctColored := pctPlain
-	if opts.Color {
-		pctColored = colorForLeft(m.Left) + pctPlain + "\x1b[0m"
-	}
-	rem := formatRemaining(m.Reset, m.ResetText, opts.Now, opts.JA)
-	remW := displayWidth(rem)
-
-	if rem != "" {
-		if barW := maxW - leftW - 6 - 3 - remW; barW >= 5 {
-			if barW > 20 {
-				barW = 20
-			}
-			return leftCol + renderBar(m.Left, barW, opts.Color) + pctColored + "   " + rem
-		}
+func renderMeterLine(m quotaMeter, gLabel string, ml meterLayout, maxW int, opts statusRenderOpts) string {
+	var leftCol string
+	if !ml.compactPrefix {
+		groupCol := padRightWidth(truncateWidth(gLabel, 9), 10)
+		winCol := padRightWidth(truncateWidth(translateWindow(m.Window, opts.JA), ml.winW), ml.winW) + "  "
+		leftCol = "   " + groupCol + winCol
 	} else {
-		if barW := maxW - leftW - 6; barW >= 5 {
-			if barW > 20 {
-				barW = 20
-			}
-			return leftCol + renderBar(m.Left, barW, opts.Color) + pctColored
+		leftCol = " "
+		if ml.groupW > 0 {
+			leftCol += padRightWidth(truncateWidth(gLabel, ml.groupW), ml.groupW) + " "
 		}
+		leftCol += padRightWidth(truncateWidth(translateWindow(m.Window, opts.JA), ml.winW), ml.winW)
 	}
 
-	// バーを省いて残量%とリセットを残す
-	if rem != "" {
-		if leftW+6+3+remW <= maxW {
-			return leftCol + pctColored + "   " + rem
-		}
-		if leftW+6+1+remW <= maxW {
-			return leftCol + pctColored + " " + rem
-		}
-		tightPctPlain := fmt.Sprintf(" %3d%%", m.Left)
-		tightPctColored := tightPctPlain
-		if opts.Color {
-			tightPctColored = colorForLeft(m.Left) + tightPctPlain + "\x1b[0m"
-		}
-		if leftW+5+1+remW <= maxW {
-			return leftCol + tightPctColored + " " + rem
-		}
-	}
-	if leftW+6 <= maxW {
-		return leftCol + pctColored
-	}
-
-	// 極端に狭い端末向け: インデント・グループ幅を詰める
-	cPrefix := " "
-	if gLabel != "" {
-		cPrefix += truncateWidth(gLabel, 6) + " "
-	}
-	cPrefix += translateWindow(m.Window, opts.JA)
-	cPctPlain := fmt.Sprintf(" %3d%%", m.Left)
-	cPctColored := cPctPlain
+	pctPlain := fmt.Sprintf(ml.pctFmt, m.Left)
+	pct := pctPlain
 	if opts.Color {
-		cPctColored = colorForLeft(m.Left) + cPctPlain + "\x1b[0m"
+		pct = colorForLeft(m.Left) + pctPlain + "\x1b[0m"
 	}
-	cBaseW := displayWidth(cPrefix) + displayWidth(cPctPlain)
-	if rem != "" && cBaseW+1+remW <= maxW {
-		return cPrefix + cPctColored + " " + rem
+	bar := ""
+	if ml.barW > 0 {
+		bar = renderBar(m.Left, ml.barW, opts.Color)
 	}
-	if cBaseW <= maxW {
-		return cPrefix + cPctColored
+	line := leftCol + bar + pct
+	if ml.showRem {
+		if rem := formatRemaining(m.Reset, m.ResetText, opts.Now, opts.JA); rem != "" {
+			line += strings.Repeat(" ", ml.remGap) + rem
+		}
 	}
-	return truncateWidth(cPrefix+cPctPlain, maxW)
+	if !opts.Color && displayWidth(line) > maxW {
+		return truncateWidth(line, maxW)
+	}
+	return line
 }
 
 func displayBackendName(backend string) string {
