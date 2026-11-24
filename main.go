@@ -57,6 +57,12 @@ func newServer() *server {
 }
 
 func main() {
+	if handled, code := runCLIArgs(os.Args, isCharDevice(os.Stdin), isLiveTTY(os.Stdout), os.Stdout, os.Stderr); handled {
+		if code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
 	s := newServer()
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)

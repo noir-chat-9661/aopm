@@ -455,8 +455,8 @@ func runStatus(ctx context.Context, backend, binary string) (string, error) {
 		text := strings.TrimSpace(stripANSI(r.Stdout + "\n" + r.Stderr))
 		if r.TimedOut {
 			auth = "timed out"
-		} else if backend == "claude" {
-			// 生の出力はメールアドレスや組織名を含むため返さない。
+		} else if backend == "claude" || backend == "codex" {
+			// 生の出力はメールアドレス・組織名・マスク済みAPIキーを含みうるため返さない。
 			auth = "not logged in"
 			if r.ExitCode == 0 {
 				auth = "logged in"
@@ -469,7 +469,8 @@ func runStatus(ctx context.Context, backend, binary string) (string, error) {
 			auth = "no output"
 		}
 	}
-	return fmt.Sprintf("binary: %s\nversion: %s\nauth: %s", binary, version, auth), nil
+	q := quota(ctx, backend, binary)
+	return fmt.Sprintf("binary: %s\nversion: %s\nauth: %s\nquota: %s", binary, version, auth, formatQuotaField(q)), nil
 }
 
 func firstLine(s string) string {
