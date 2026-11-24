@@ -23,7 +23,7 @@ if [ "$FAKE_MODE" = "big" ]; then head -c 33554433 /dev/zero; exit 0; fi
 if [ "$FAKE_MODE" = "fail" ]; then printf '%2048s\n' error >&2; exit 7; fi
 if [ "$FAKE_MODE" = "sleep" ]; then (sleep 30) & echo $! > "$FAKE_CHILD"; wait; fi
 case "$FAKE_KIND" in
-antigravity) printf '%s\n' '{"conversation_id":"agy-1","status":"SUCCESS","response":"ok"}' ;;
+antigravity) if [ "$FAKE_MODE" = denied ]; then printf '%s\n' '{"conversation_id":"agy-2","status":"SUCCESS","response":"","denied_actions":[{"action":"command"}]}'; exit 0; fi; printf '%s\n' '{"conversation_id":"agy-1","status":"SUCCESS","response":"ok"}' ;;
 codex) printf '%s\n' '{"type":"thread.started","thread_id":"codex-1"}' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}' '{"type":"turn.completed"}' ;;
 copilot) printf 'ok\n' ;;
 claude) printf '%s\n' '{"result":"ok","is_error":false,"session_id":"claude-1","subtype":"success"}' ;;
@@ -91,10 +91,7 @@ func TestBackendAskContinueAndPersistence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			args := map[string]any{"prompt": "hello", "workspace": ws, "timeout_s": 5}
-			if backend != "antigravity" {
-				args["sandbox"] = "workspace-write"
-			}
+			args := map[string]any{"prompt": "hello", "workspace": ws, "timeout_s": 5, "sandbox": "workspace-write"}
 			answer, err := executeTool(context.Background(), backend+"_ask", callJSON(t, args))
 			if err != nil || answer != "ok" {
 				t.Fatalf("ask: %q, %v", answer, err)
@@ -105,7 +102,7 @@ func TestBackendAskContinueAndPersistence(t *testing.T) {
 			}
 			argv := string(logBytes)
 			for _, want := range map[string][]string{
-				"antigravity": {"--print-timeout", "--disable-slash-commands", "-p", "hello"},
+				"antigravity": {"--print-timeout", "--disable-slash-commands", "--sandbox\n--settings\n" + antigravitySettings("workspace-write"), "-p", "hello"},
 				"codex":       {"--json", "--skip-git-repo-check", "-s", "workspace-write", "-C", canonical, "--", "-"},
 				"copilot":     {"--session-id", "-C", canonical, "--allow-all-tools", "--model", "auto", "-s", "-p", "hello"},
 				"claude":      {"--output-format", "json", "--permission-mode", "acceptEdits", "-p"},
@@ -124,7 +121,7 @@ func TestBackendAskContinueAndPersistence(t *testing.T) {
 			if json.Unmarshal(b, &pin) != nil || pin.Session == "" {
 				t.Fatalf("bad pin: %s", b)
 			}
-			if backend != "antigravity" && pin.Sandbox != "workspace-write" {
+			if pin.Sandbox != "workspace-write" {
 				t.Fatalf("sandbox not persisted: %+v", pin)
 			}
 			answer, err = executeTool(context.Background(), backend+"_continue", callJSON(t, map[string]any{"prompt": "again", "workspace": ws, "timeout_s": 5}))
@@ -137,7 +134,7 @@ func TestBackendAskContinueAndPersistence(t *testing.T) {
 			}
 			cargv := strings.TrimPrefix(string(continued), argv)
 			want := map[string]string{
-				"antigravity": "--conversation\nagy-1",
+				"antigravity": "--settings\n" + antigravitySettings("workspace-write") + "\n--disable-slash-commands\n--mode\naccept-edits\n--output-format\njson\n--conversation\nagy-1",
 				"codex":       "sandbox_mode=workspace-write\n--\ncodex-1\n-",
 				"copilot":     "--session-id\n" + pin.Session,
 				"claude":      "--resume\nclaude-1",
@@ -319,6 +316,53 @@ func TestToolCallAcceptsMeta(t *testing.T) {
 	name, _, err := decodeToolCall(json.RawMessage(`{"name":"codex_status","arguments":{},"_meta":{"progressToken":1}}`))
 	if err != nil || name != "codex_status" {
 		t.Fatalf("_meta rejected: %q, %v", name, err)
+	}
+}
+
+func TestAntigravityPolicy(t *testing.T) {
+	for sandbox, wantWrite := range map[string]bool{"read-only": false, "": false, "workspace-write": true} {
+		var s struct {
+			AgentMode               *string
+			ToolPermission          string
+			AllowNonWorkspaceAccess *bool
+			Permissions             struct{ Deny []string }
+		}
+		if err := json.Unmarshal([]byte(antigravitySettings(sandbox)), &s); err != nil {
+			t.Fatal(err)
+		}
+		deny := strings.Join(s.Permissions.Deny, " ")
+		if s.AgentMode == nil || *s.AgentMode != "" || s.ToolPermission != "proceed-in-sandbox" || s.AllowNonWorkspaceAccess == nil || *s.AllowNonWorkspaceAccess {
+			t.Fatalf("%q: %+v", sandbox, s)
+		}
+		if !strings.Contains(deny, "mcp(*)") || !strings.Contains(deny, "unsandboxed(*)") {
+			t.Fatalf("%q: escape routes open: %s", sandbox, deny)
+		}
+		if strings.Contains(deny, "write_file(*)") == wantWrite || strings.Contains(deny, " command(*)") == wantWrite {
+			t.Fatalf("%q: %s", sandbox, deny)
+		}
+	}
+	// 拒否で止まっても、作業途中のセッションを再開できる。
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("FAKE_KIND", "antigravity")
+	t.Setenv("FAKE_MODE", "denied")
+	t.Setenv("AGY_BIN", fakeBinary(t))
+	ws, err := normalizeWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := executeTool(context.Background(), "antigravity_ask", callJSON(t, map[string]any{"prompt": "x", "workspace": ws, "sandbox": "workspace-write"})); err == nil || !strings.Contains(err.Error(), "policy denied") {
+		t.Fatalf("denied: %v", err)
+	}
+	if p, _, err := loadSession("antigravity", ws); err != nil || p.Session != "agy-2" || p.Sandbox != "workspace-write" {
+		t.Fatalf("%+v %v", p, err)
+	}
+	// サンドボックス対応前に保存された記録は read-only として再開する。
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	if err := saveSession("antigravity", "/ws", sessionPin{Session: "old", Sandbox: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _, err := loadSession("antigravity", "/ws"); err != nil || p.Sandbox != "read-only" {
+		t.Fatalf("%+v %v", p, err)
 	}
 }
 

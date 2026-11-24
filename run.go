@@ -60,7 +60,10 @@ func loadSession(backend, workspace string) (sessionPin, bool, error) {
 	if json.Unmarshal(b, &p) != nil || strings.TrimSpace(p.Session) == "" || p.Sandbox == "" {
 		return sessionPin{}, false, fmt.Errorf("saved session is corrupt")
 	}
-	if backend != "antigravity" && p.Sandbox != "read-only" && p.Sandbox != "workspace-write" {
+	if backend == "antigravity" && p.Sandbox == "none" { // sandbox対応前に保存された記録
+		p.Sandbox = "read-only"
+	}
+	if p.Sandbox != "read-only" && p.Sandbox != "workspace-write" {
 		return sessionPin{}, false, fmt.Errorf("saved session has an invalid sandbox")
 	}
 	return p, true, nil
@@ -272,6 +275,20 @@ func runBackend(ctx context.Context, o runOptions) (backendResult, error) {
 	}
 }
 
+// antigravitySettings は呼び出し単位で利用者の設定を上書きする。headlessでは確認が必要な操作は
+// 自動拒否される。agentModeを空にしないと既定のAutoモードになり、サンドボックスのバイパスが
+// AIの審査だけで承認されてしまう。MCPサーバーは境界の外で動くので両モードで禁止する。
+func antigravitySettings(sandbox string) string {
+	deny := `"mcp(*)","unsandboxed(*)"`
+	if sandbox != "workspace-write" {
+		deny += `,"command(*)","write_file(*)"`
+	}
+	return `{"agentMode":"","toolPermission":"proceed-in-sandbox","allowNonWorkspaceAccess":false,"permissions":{"allow":["read_file(*)"],"deny":[` + deny + `]}}`
+}
+
+// 拒否されるとターンごと終わるため、バイパスを試させない。
+const antigravityNote = "\n\n[Sandbox: only the workspace and the temp directory are writable and there is no network. Never set BypassSandbox and never write elsewhere; a denied action ends this run. If a tool cache is not writable, point it at the temp directory (e.g. GOCACHE=/tmp/go-cache).]"
+
 func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	fields := strings.Fields(o.Prompt)
 	first := ""
@@ -282,11 +299,14 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	if o.Plan && strings.HasPrefix(first, "/") && !strings.Contains(first[1:], "/") {
 		return backendResult{}, fmt.Errorf("plan mode refuses slash-command prompts")
 	}
-	args := []string{o.Binary, "--print-timeout", fmt.Sprintf("%ds", o.Timeout), "--dangerously-skip-permissions"}
+	args := []string{o.Binary, "--print-timeout", fmt.Sprintf("%ds", o.Timeout), "--sandbox", "--settings", antigravitySettings(o.Sandbox)}
 	if o.Plan {
 		args = append(args, "--mode", "plan")
 	} else {
 		args = append(args, "--disable-slash-commands")
+		if o.Sandbox == "workspace-write" {
+			args = append(args, "--mode", "accept-edits")
+		}
 	}
 	args = append(args, "--output-format", "json")
 	if len(o.Schema) != 0 {
@@ -301,7 +321,11 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	if o.Continue {
 		args = append(args, "--conversation", o.Session)
 	}
-	args = append(args, "-p", o.Prompt)
+	prompt := o.Prompt
+	if o.Sandbox == "workspace-write" {
+		prompt += antigravityNote
+	}
+	args = append(args, "-p", prompt)
 	r := runCLI(ctx, args, o.Workspace, nil, nil, time.Duration(o.Timeout+30)*time.Second)
 	obj, _ := findJSONObject(r.Stdout, "response")
 	if r.TimedOut || strings.Contains(strings.ToLower(r.Stderr), "print timeout after") {
@@ -327,6 +351,10 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	}
 	answer := responseText(obj)
 	if strings.TrimSpace(answer) == "" {
+		if denied := string(obj["denied_actions"]); denied != "" && denied != "null" && denied != "[]" {
+			// agyは拒否された時点で終わる。それまでの編集は残るので、再開できるようセッションを返す。
+			return backendResult{Session: rawString(obj["conversation_id"])}, fmt.Errorf("agy stopped: the sandbox=%q policy denied %s; earlier edits remain, use antigravity_continue to resume without that action", o.Sandbox, denied)
+		}
 		return backendResult{}, fmt.Errorf("agy produced an empty response")
 	}
 	if len(o.Schema) != 0 {

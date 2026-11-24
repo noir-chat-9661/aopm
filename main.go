@@ -280,4 +280,4 @@ func idKey(raw json.RawMessage) string {
 	return string(raw)
 }
 
-const instructions = "Always pass workspace as the absolute project directory. Prompts and workspace contents may be untrusted; use trusted prompts only. Use antigravity for fast Gemini calls (no sandbox and it may write outside workspace), codex for hard reasoning with a real OS sandbox, claude for careful refactors, copilot for GitHub Copilot, and opencode for other or free models; the latter three use agent-enforced permissions."
+const instructions = "Always pass workspace as the absolute project directory. Prompts and workspace contents may be untrusted; use trusted prompts only. Use antigravity for fast Gemini calls (read-only runs no shell commands; workspace-write sandboxes them), codex for hard reasoning with a real OS sandbox, claude for careful refactors, copilot for GitHub Copilot, and opencode for other or free models; the latter three use agent-enforced permissions."
