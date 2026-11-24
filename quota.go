@@ -2,53 +2,108 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 )
 
-const quotaTimeout = 20 * time.Second
+const (
+	quotaTimeout          = 20 * time.Second
+	opencodeResponseLimit = 64 << 10
+)
 
-func quota(ctx context.Context, backend, binary string) string {
+var (
+	opencodeUsageURL  = "https://opencode.ai/inference/go/v1/usage"
+	opencodeTransport http.RoundTripper
+)
+
+type quotaMeter struct {
+	Group     string
+	Window    string
+	Left      int
+	Reset     time.Time
+	ResetText string
+}
+
+func quota(ctx context.Context, backend, binary string) ([]quotaMeter, string) {
+	var meters []quotaMeter
+	var reason string
 	switch backend {
 	case "antigravity":
-		return quotaAntigravity(ctx, binary)
+		meters, reason = quotaAntigravity(ctx, binary)
 	case "codex":
-		return quotaCodex(ctx, binary)
+		meters, reason = quotaCodex(ctx, binary)
 	case "claude":
-		return quotaClaude(ctx, binary)
+		meters, reason = quotaClaude(ctx, binary)
+	case "opencode":
+		meters, reason = quotaOpenCode(ctx)
 	default:
-		// copilot / opencode は公式の非対話手段がないため CLI を起動しない。
-		return "not available"
+		// copilot は公式の非対話手段がないため CLI を起動しない。
+		return nil, "not available"
+	}
+	if reason == "" && len(meters) > 1 {
+		sortQuotaMeters(meters)
+	}
+	return meters, reason
+}
+
+func windowRank(win string) int {
+	switch win {
+	case "5h":
+		return 0
+	case "weekly":
+		return 1
+	case "monthly":
+		return 2
+	default:
+		return 3
 	}
 }
 
-func quotaAntigravity(ctx context.Context, binary string) string {
+func sortQuotaMeters(meters []quotaMeter) {
+	groupOrder := make(map[string]int, len(meters))
+	for _, m := range meters {
+		if _, ok := groupOrder[m.Group]; !ok {
+			groupOrder[m.Group] = len(groupOrder)
+		}
+	}
+	sort.SliceStable(meters, func(i, j int) bool {
+		gi, gj := groupOrder[meters[i].Group], groupOrder[meters[j].Group]
+		if gi != gj {
+			return gi < gj
+		}
+		return windowRank(meters[i].Window) < windowRank(meters[j].Window)
+	})
+}
+
+func quotaAntigravity(ctx context.Context, binary string) ([]quotaMeter, string) {
 	r := runCLI(ctx, []string{binary, "-p", "/usage", "--output-format", "json"}, os.TempDir(), nil, nil, quotaTimeout)
 	if r.TimedOut {
-		return "timed out"
+		return nil, "timed out"
 	}
 	if r.Cancelled {
-		return "cancelled"
+		return nil, "cancelled"
 	}
 	if r.StartErr != nil || r.ExitCode != 0 {
-		return "not available"
+		return nil, "not available"
 	}
 	obj, ok := findJSONObject(r.Stdout, "command")
 	if !ok {
-		return "not available"
+		return nil, "not available"
 	}
 	var cmd struct {
 		Data struct {
@@ -63,10 +118,9 @@ func quotaAntigravity(ctx context.Context, binary string) string {
 		} `json:"data"`
 	}
 	if json.Unmarshal(obj["command"], &cmd) != nil {
-		return "not available"
+		return nil, "not available"
 	}
-	now := time.Now()
-	var lines []string
+	var meters []quotaMeter
 	for _, g := range cmd.Data.Groups {
 		gName := sanitizeText(g.Name)
 		for _, b := range g.Buckets {
@@ -77,24 +131,25 @@ func quotaAntigravity(ctx context.Context, binary string) string {
 			if win == "" {
 				win = "quota"
 			}
-			label := win
-			if gName != "" {
-				label = gName + " " + win
-			}
 			var resetAt time.Time
 			if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(b.ResetTime)); err == nil && t.Year() > 1970 {
 				resetAt = t
 			}
-			lines = append(lines, formatQuotaLine(label, clampPercent(*b.RemainingFraction*100), resetAt, now))
+			meters = append(meters, quotaMeter{
+				Group:  gName,
+				Window: win,
+				Left:   clampPercent(*b.RemainingFraction * 100),
+				Reset:  resetAt,
+			})
 		}
 	}
-	if len(lines) == 0 {
-		return "not available"
+	if len(meters) == 0 {
+		return nil, "not available"
 	}
-	return strings.Join(lines, "\n")
+	return meters, ""
 }
 
-func quotaCodex(parent context.Context, binary string) string {
+func quotaCodex(parent context.Context, binary string) ([]quotaMeter, string) {
 	ctx, cancel := context.WithTimeout(parent, quotaTimeout)
 	defer cancel()
 
@@ -105,20 +160,20 @@ func quotaCodex(parent context.Context, binary string) string {
 
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
-		return "not available"
+		return nil, "not available"
 	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
-		return "not available"
+		return nil, "not available"
 	}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = io.Discard
 	if err := cmd.Start(); err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
-		return "not available"
+		return nil, "not available"
 	}
 	_ = stdoutW.Close()
 
@@ -213,20 +268,20 @@ func quotaCodex(parent context.Context, binary string) string {
 		},
 	})
 	if err != nil {
-		return "not available"
+		return nil, "not available"
 	}
 	if _, err := stdin.Write(append(initReq, '\n')); err != nil {
-		return "not available"
+		return nil, "not available"
 	}
 	if _, reason := waitID(1); reason != "" {
-		return reason
+		return nil, reason
 	}
 	if _, err := io.WriteString(stdin, "{\"method\":\"initialized\"}\n{\"id\":2,\"method\":\"account/rateLimits/read\"}\n"); err != nil {
-		return "not available"
+		return nil, "not available"
 	}
 	res, reason := waitID(2)
 	if reason != "" {
-		return reason
+		return nil, reason
 	}
 
 	type codexWindow struct {
@@ -241,11 +296,10 @@ func quotaCodex(parent context.Context, binary string) string {
 		} `json:"rateLimits"`
 	}
 	if json.Unmarshal(res, &payload) != nil {
-		return "not available"
+		return nil, "not available"
 	}
 
-	now := time.Now()
-	var lines []string
+	var meters []quotaMeter
 	for _, entry := range []struct {
 		name string
 		w    *codexWindow
@@ -257,7 +311,7 @@ func quotaCodex(parent context.Context, binary string) string {
 		if w == nil || w.UsedPercent == nil {
 			continue
 		}
-		label := codexWindowLabel(entry.name, w.WindowDurationMins)
+		win := codexWindowLabel(entry.name, w.WindowDurationMins)
 		var resetAt time.Time
 		if w.ResetsAt != nil && *w.ResetsAt > 0 {
 			t := time.Unix(*w.ResetsAt, 0)
@@ -265,12 +319,16 @@ func quotaCodex(parent context.Context, binary string) string {
 				resetAt = t
 			}
 		}
-		lines = append(lines, formatQuotaLine(label, clampPercent(100-*w.UsedPercent), resetAt, now))
+		meters = append(meters, quotaMeter{
+			Window: win,
+			Left:   clampPercent(100 - *w.UsedPercent),
+			Reset:  resetAt,
+		})
 	}
-	if len(lines) == 0 {
-		return "not available"
+	if len(meters) == 0 {
+		return nil, "not available"
 	}
-	return strings.Join(lines, "\n")
+	return meters, ""
 }
 
 func codexWindowLabel(fallback string, mins *int) string {
@@ -295,23 +353,24 @@ func codexWindowLabel(fallback string, mins *int) string {
 
 var claudeUsageRE = regexp.MustCompile(`^Current\s+([^:]+):\s*([0-9]+(?:\.[0-9]+)?)%\s*used(?:\s*[·•|-]\s*resets\s+(.+))?$`)
 
-func quotaClaude(ctx context.Context, binary string) string {
+func quotaClaude(ctx context.Context, binary string) ([]quotaMeter, string) {
 	args := []string{binary, "-p", "/usage", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config", "--settings", `{"disableAllHooks":true}`, "--setting-sources", ""}
 	r := runCLI(ctx, args, os.TempDir(), nil, claudeEnv(), quotaTimeout)
 	if r.TimedOut {
-		return "timed out"
+		return nil, "timed out"
 	}
 	if r.Cancelled {
-		return "cancelled"
+		return nil, "cancelled"
 	}
 	if r.StartErr != nil || r.ExitCode != 0 {
-		return "not available"
+		return nil, "not available"
 	}
 	resultText := extractClaudeResult(r.Stdout)
 	if strings.TrimSpace(resultText) == "" {
-		return "not available"
+		return nil, "not available"
 	}
-	var lines []string
+	now := time.Now()
+	var meters []quotaMeter
 	for _, line := range strings.Split(stripANSI(resultText), "\n") {
 		line = strings.TrimSpace(line)
 		m := claudeUsageRE.FindStringSubmatch(line)
@@ -322,19 +381,55 @@ func quotaClaude(ctx context.Context, binary string) string {
 		if err != nil {
 			continue
 		}
-		label := claudeWindowLabel(sanitizeText(m[1]))
+		win := claudeWindowLabel(sanitizeText(m[1]))
 		pct := clampPercent(100 - used)
-		resetRaw := sanitizeText(m[3])
-		if resetRaw != "" {
-			lines = append(lines, fmt.Sprintf("%s %d%% left (resets %s)", label, pct, resetRaw))
-		} else {
-			lines = append(lines, fmt.Sprintf("%s %d%% left", label, pct))
+		resetAt, resetText := parseClaudeReset(m[3], now)
+		meters = append(meters, quotaMeter{
+			Window:    win,
+			Left:      pct,
+			Reset:     resetAt,
+			ResetText: resetText,
+		})
+	}
+	if len(meters) == 0 {
+		return nil, "not available"
+	}
+	return meters, ""
+}
+
+func parseClaudeReset(raw string, now time.Time) (time.Time, string) {
+	clean := sanitizeText(raw)
+	if clean == "" {
+		return time.Time{}, ""
+	}
+	loc := now.Location()
+	datePart := clean
+	if strings.HasSuffix(clean, ")") {
+		if idx := strings.LastIndex(clean, "("); idx >= 0 {
+			tzName := strings.TrimSpace(clean[idx+1 : len(clean)-1])
+			datePart = strings.TrimSpace(clean[:idx])
+			if tzName == "" {
+				return time.Time{}, clean
+			}
+			loaded, err := time.LoadLocation(tzName)
+			if err != nil {
+				return time.Time{}, clean
+			}
+			loc = loaded
 		}
 	}
-	if len(lines) == 0 {
-		return "not available"
+	for _, layout := range []string{"Jan 2 at 3:04pm", "Jan 2 at 3pm"} {
+		parsed, err := time.ParseInLocation(layout, datePart, loc)
+		if err == nil {
+			nowInLoc := now.In(loc)
+			t := time.Date(nowInLoc.Year(), parsed.Month(), parsed.Day(), parsed.Hour(), parsed.Minute(), 0, 0, loc)
+			if t.Before(nowInLoc.AddDate(0, -6, 0)) {
+				t = t.AddDate(1, 0, 0)
+			}
+			return t, ""
+		}
 	}
-	return strings.Join(lines, "\n")
+	return time.Time{}, clean
 }
 
 func extractClaudeResult(stdout string) string {
@@ -371,6 +466,131 @@ func claudeWindowLabel(name string) string {
 	}
 }
 
+func quotaOpenCode(parent context.Context) ([]quotaMeter, string) {
+	key, ok := readOpenCodeGoKey()
+	if !ok {
+		return nil, "not available"
+	}
+	ctx, cancel := context.WithTimeout(parent, quotaTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, opencodeUsageURL, nil)
+	if err != nil {
+		return nil, "not available"
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+
+	client := &http.Client{
+		Timeout:   quotaTimeout,
+		Transport: opencodeTransport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, "timed out"
+		}
+		if ctx.Err() == context.Canceled {
+			return nil, "cancelled"
+		}
+		return nil, "not available"
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "not available"
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, opencodeResponseLimit+1))
+	if err != nil || len(body) > opencodeResponseLimit {
+		return nil, "not available"
+	}
+
+	type openCodeEntry struct {
+		Percent  *float64 `json:"percent"`
+		ResetsAt string   `json:"resetsAt"`
+	}
+	var payload struct {
+		Usage struct {
+			Rolling *openCodeEntry `json:"rolling"`
+			Weekly  *openCodeEntry `json:"weekly"`
+			Monthly *openCodeEntry `json:"monthly"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return nil, "not available"
+	}
+
+	var meters []quotaMeter
+	for _, item := range []struct {
+		win   string
+		entry *openCodeEntry
+	}{
+		{"5h", payload.Usage.Rolling},
+		{"weekly", payload.Usage.Weekly},
+		{"monthly", payload.Usage.Monthly},
+	} {
+		if item.entry == nil || item.entry.Percent == nil {
+			continue
+		}
+		var resetAt time.Time
+		if t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(item.entry.ResetsAt)); err == nil && t.Year() > 1970 {
+			resetAt = t
+		}
+		meters = append(meters, quotaMeter{
+			Window: item.win,
+			Left:   clampPercent(100 - *item.entry.Percent),
+			Reset:  resetAt,
+		})
+	}
+	if len(meters) == 0 {
+		return nil, "not available"
+	}
+	return meters, ""
+}
+
+func readOpenCodeGoKey() (string, bool) {
+	root := os.Getenv("XDG_DATA_HOME")
+	if !filepath.IsAbs(root) {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return "", false
+		}
+		root = filepath.Join(home, ".local", "share")
+	}
+	b, err := os.ReadFile(filepath.Join(root, "opencode", "auth.json"))
+	if err != nil {
+		return "", false
+	}
+	var auth struct {
+		OpenCodeGo *struct {
+			Type string `json:"type"`
+			Key  string `json:"key"`
+		} `json:"opencode-go"`
+	}
+	if json.Unmarshal(b, &auth) != nil || auth.OpenCodeGo == nil || auth.OpenCodeGo.Type != "api" {
+		return "", false
+	}
+	if !validBearerKey(auth.OpenCodeGo.Key) {
+		return "", false
+	}
+	return auth.OpenCodeGo.Key, true
+}
+
+func validBearerKey(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r <= 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
 func clampPercent(v float64) int {
 	p := int(math.Round(v))
 	if p < 0 {
@@ -382,17 +602,33 @@ func clampPercent(v float64) int {
 	return p
 }
 
-func formatQuotaLine(label string, remainingPct int, resetAt, now time.Time) string {
-	line := fmt.Sprintf("%s %d%% left", label, remainingPct)
-	if !resetAt.IsZero() && resetAt.Year() > 1970 {
-		local := resetAt.In(time.Local)
-		layout := "15:04"
-		if local.Sub(now) >= 24*time.Hour {
-			layout = "Jan 2 15:04"
-		}
-		line += " (resets " + local.Format(layout) + ")"
+func formatQuotaMCP(meters []quotaMeter, reason string, now time.Time) string {
+	if reason != "" {
+		return reason
 	}
-	return line
+	if len(meters) == 0 {
+		return "not available"
+	}
+	lines := make([]string, 0, len(meters))
+	for _, m := range meters {
+		label := m.Window
+		if m.Group != "" {
+			label = m.Group + " " + m.Window
+		}
+		line := fmt.Sprintf("%s %d%% left", label, m.Left)
+		if !m.Reset.IsZero() && m.Reset.Year() > 1970 {
+			local := m.Reset.In(time.Local)
+			layout := "15:04"
+			if local.Sub(now) >= 24*time.Hour {
+				layout = "Jan 2 15:04"
+			}
+			line += " (resets " + local.Format(layout) + ")"
+		} else if m.ResetText != "" {
+			line += " (resets " + m.ResetText + ")"
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func formatQuotaField(q string) string {
@@ -413,211 +649,14 @@ func sanitizeText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-type backendStatus struct {
-	Name      string
-	Installed bool
-	Version   string
-	Auth      string
-	Quota     string
-}
+var versionNumRE = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
 
-type statusUpdate struct {
-	idx   int
-	field string
-	val   string
-}
-
-func isCharDevice(f *os.File) bool {
-	if f == nil {
-		return false
+func extractVersion(raw string) string {
+	s := sanitizeText(raw)
+	if m := versionNumRE.FindString(s); m != "" {
+		return m
 	}
-	fi, err := f.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
-		return false
-	}
-	if dn, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, dn) {
-		return false
-	}
-	return true
-}
-
-func isLiveTTY(w io.Writer) bool {
-	term := os.Getenv("TERM")
-	if term == "" || term == "dumb" {
-		return false
-	}
-	f, ok := w.(*os.File)
-	return ok && isCharDevice(f)
-}
-
-func runCLIArgs(args []string, stdinIsTTY, stdoutIsTTY bool, stdout, stderr io.Writer) (handled bool, exitCode int) {
-	if len(args) <= 1 {
-		if !stdinIsTTY {
-			return false, 0
-		}
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
-		printAllStatuses(ctx, stdout, stdoutIsTTY)
-		if ctx.Err() != nil {
-			return true, 130
-		}
-		exe, err := os.Executable()
-		if err != nil || exe == "" {
-			exe = "aopm"
-		}
-		fmt.Fprintf(stdout, "\nMCP server: run via an MCP client (e.g. mcpm add aopm -- %s)\n", exe)
-		return true, 0
-	}
-	if len(args) == 2 {
-		switch args[1] {
-		case "status":
-			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-			defer stop()
-			printAllStatuses(ctx, stdout, stdoutIsTTY)
-			if ctx.Err() != nil {
-				return true, 130
-			}
-			return true, 0
-		case "--version", "version":
-			fmt.Fprintf(stdout, "aopm %s\n", version)
-			return true, 0
-		case "--help", "-h", "help":
-			printUsage(stdout)
-			return true, 0
-		}
-	}
-	printUsage(stderr)
-	return true, 2
-}
-
-func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: aopm [status | --version | --help]")
-	fmt.Fprintln(w, "Run with no arguments on a pipe to start the MCP stdio server.")
-}
-
-func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
-	statuses := make([]backendStatus, len(backendNames))
-	for i, name := range backendNames {
-		statuses[i] = backendStatus{
-			Name:      name,
-			Installed: true,
-			Version:   "fetching...",
-			Auth:      "fetching...",
-			Quota:     "fetching...",
-		}
-	}
-
-	prevLines := 0
-	if live {
-		defer func() { _, _ = io.WriteString(w, "\x1b[?7h") }()
-		writeLiveFrame(w, renderStatuses(statuses), &prevLines, true)
-	}
-
-	updates := make(chan statusUpdate, len(backendNames)*3)
-	var wg sync.WaitGroup
-	for i, b := range backendNames {
-		wg.Add(1)
-		go func(idx int, backend string) {
-			defer wg.Done()
-			bin, err := resolveBackendBinary(backend)
-			if err != nil {
-				updates <- statusUpdate{idx: idx, field: "missing"}
-				return
-			}
-			var subWg sync.WaitGroup
-			subWg.Add(3)
-			go func() {
-				defer subWg.Done()
-				updates <- statusUpdate{idx: idx, field: "version", val: fetchVersion(ctx, backend, bin)}
-			}()
-			go func() {
-				defer subWg.Done()
-				updates <- statusUpdate{idx: idx, field: "auth", val: summarizeAuth(ctx, backend, bin)}
-			}()
-			go func() {
-				defer subWg.Done()
-				updates <- statusUpdate{idx: idx, field: "quota", val: quota(ctx, backend, bin)}
-			}()
-			subWg.Wait()
-		}(i, b)
-	}
-	go func() {
-		wg.Wait()
-		close(updates)
-	}()
-
-	for u := range updates {
-		switch u.field {
-		case "missing":
-			statuses[u.idx].Installed = false
-		case "version":
-			if u.val == "not installed" {
-				statuses[u.idx].Installed = false
-			} else {
-				statuses[u.idx].Version = u.val
-			}
-		case "auth":
-			statuses[u.idx].Auth = u.val
-		case "quota":
-			statuses[u.idx].Quota = u.val
-		}
-		if live {
-			writeLiveFrame(w, renderStatuses(statuses), &prevLines, false)
-		}
-	}
-
-	if ctx.Err() != nil {
-		for i := range statuses {
-			if statuses[i].Version == "fetching..." {
-				statuses[i].Version = "cancelled"
-			}
-			if statuses[i].Auth == "fetching..." {
-				statuses[i].Auth = "cancelled"
-			}
-			if statuses[i].Quota == "fetching..." {
-				statuses[i].Quota = "cancelled"
-			}
-		}
-		if live {
-			writeLiveFrame(w, renderStatuses(statuses), &prevLines, false)
-		}
-	}
-	if !live {
-		_, _ = io.WriteString(w, renderStatuses(statuses))
-	}
-}
-
-func renderStatuses(statuses []backendStatus) string {
-	var buf bytes.Buffer
-	for _, st := range statuses {
-		if !st.Installed {
-			fmt.Fprintf(&buf, "%-11s not installed\n", st.Name)
-			continue
-		}
-		fmt.Fprintf(&buf, "%-11s %s  %s\n", st.Name, st.Version, st.Auth)
-		switch st.Quota {
-		case "fetching...", "not available", "timed out", "cancelled":
-			fmt.Fprintf(&buf, "  quota %s\n", st.Quota)
-		default:
-			for _, ql := range strings.Split(st.Quota, "\n") {
-				fmt.Fprintf(&buf, "  %s\n", ql)
-			}
-		}
-	}
-	return buf.String()
-}
-
-func writeLiveFrame(w io.Writer, frame string, prevLines *int, first bool) {
-	var buf bytes.Buffer
-	if first {
-		buf.WriteString("\x1b[?7l")
-	}
-	if *prevLines > 0 {
-		fmt.Fprintf(&buf, "\x1b[%dA\x1b[J", *prevLines)
-	}
-	buf.WriteString(frame)
-	_, _ = w.Write(buf.Bytes())
-	*prevLines = strings.Count(frame, "\n")
+	return s
 }
 
 func fetchVersion(ctx context.Context, backend, binary string) string {
@@ -634,18 +673,17 @@ func fetchVersion(ctx context.Context, backend, binary string) string {
 		}
 		return "error"
 	}
-	return sanitizeText(firstLine(r.Stdout + "\n" + r.Stderr))
+	return extractVersion(firstLine(r.Stdout + "\n" + r.Stderr))
 }
 
 func summarizeAuth(ctx context.Context, backend, binary string) string {
-	if backend == "copilot" {
+	if backend == "copilot" || backend == "opencode" {
 		return "not verified"
 	}
 	authArgs := map[string][]string{
 		"codex":       {"login", "status"},
 		"claude":      {"auth", "status"},
 		"antigravity": {"models"},
-		"opencode":    {"auth", "list"},
 	}
 	r := runCLI(ctx, append([]string{binary}, authArgs[backend]...), "", nil, nil, 15*time.Second)
 	if r.Cancelled {
@@ -669,10 +707,6 @@ func summarizeAuth(ctx context.Context, backend, binary string) string {
 		}
 		return "not logged in"
 	default:
-		// opencode 等は終了コードだけで認証有効性を断定できない。
-		if r.ExitCode != 0 {
-			return fmt.Sprintf("command exited %d", r.ExitCode)
-		}
 		return "not verified"
 	}
 }

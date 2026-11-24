@@ -448,9 +448,16 @@ func runStatus(ctx context.Context, backend, binary string) (string, error) {
 		return "", err
 	}
 	version := firstLine(stripANSI(r.Stdout + "\n" + r.Stderr))
+	meters, qReason := quota(ctx, backend, binary)
 	auth := "not verified"
-	if backend != "copilot" {
-		authArgs := map[string][]string{"codex": {"login", "status"}, "claude": {"auth", "status"}, "antigravity": {"models"}, "opencode": {"auth", "list"}}
+	switch backend {
+	case "copilot":
+	case "opencode":
+		if qReason == "" && len(meters) > 0 {
+			auth = "logged in"
+		}
+	default:
+		authArgs := map[string][]string{"codex": {"login", "status"}, "claude": {"auth", "status"}, "antigravity": {"models"}}
 		r = runCLI(ctx, append([]string{binary}, authArgs[backend]...), "", nil, nil, 15*time.Second)
 		text := strings.TrimSpace(stripANSI(r.Stdout + "\n" + r.Stderr))
 		if r.TimedOut {
@@ -469,7 +476,7 @@ func runStatus(ctx context.Context, backend, binary string) (string, error) {
 			auth = "no output"
 		}
 	}
-	q := quota(ctx, backend, binary)
+	q := formatQuotaMCP(meters, qReason, time.Now())
 	return fmt.Sprintf("binary: %s\nversion: %s\nauth: %s\nquota: %s", binary, version, auth, formatQuotaField(q)), nil
 }
 
