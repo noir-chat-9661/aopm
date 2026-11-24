@@ -27,7 +27,7 @@ Each backend has `_ask` (new session), `_continue` (resume the session last used
 - `sandbox` defaults to `read-only`. `_continue` inherits the session's sandbox unless overridden. antigravity runs no shell commands in `read-only`, so include any diff in the prompt. In `workspace-write` its shell can write only the workspace and temp directories, with no network and no `git commit`; a denied action ends the run, and `_continue` resumes it.
 - Session IDs are stored in `${XDG_STATE_HOME:-~/.local/state}/aopm`, so `_continue` survives restarts.
 - Set `AGY_BIN`, `CODEX_BIN`, `COPILOT_BIN`, `CLAUDE_BIN` or `OPENCODE_BIN` to override a binary path.
-- Run `aopm status` (or `aopm` in a terminal) to inspect all backends' versions, auth status, and remaining quota without consuming model quota (supported: `agy` 1.1.11+, `codex`, `claude`, `opencode`; not supported: `copilot`). For OpenCode Go, `aopm` uses the official usage endpoint (`https://opencode.ai/inference/go/v1/usage`), reads only the `opencode-go` API key from `${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json`, sends it only to `opencode.ai`, and never stores it.
+- Run `aopm status` (or `aopm` in a terminal) to inspect all backends' versions, auth status, and remaining quota without consuming model quota (supported: `agy` 1.1.11+, `codex`, `claude`, and `OpenCode Go`; not supported: `copilot`). OpenCode Go quota requires an `opencode-go` API key saved in `${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json`; `aopm` reads only that key, sends it only to `https://opencode.ai/inference/go/v1/usage`, and never stores it.
 
 Every backend is an autonomous agent: use trusted prompts on trusted content only.
 
@@ -47,7 +47,7 @@ mcpm add aopm -- ~/.local/bin/aopm
 - セッションIDは `${XDG_STATE_HOME:-~/.local/state}/aopm` に保存され、再起動後も `_continue` できます。
 - antigravityのファイル編集の制限はagyの権限設定によるもので、シェルだけが `workspace-write` でOSサンドボックスに入ります。`read-only` ではシェルを使えないため、差分などはプロンプトに含めてください。`workspace-write` のシェルが書き込めるのはworkspaceと一時ディレクトリだけで、ネットワークと `git commit` は使えません。拒否されるとその場で終わり、`_continue` で再開できます（agy 1.5.16 / macOSでのみ確認）。
 - codexはOSサンドボックスで動きますが、設定済みのMCPサーバーはその外で動きます。信頼できるプロンプトと内容にだけ使ってください。
-- `aopm status`（または端末上で引数なしの `aopm`）を実行すると、各バックエンドのバージョン、ログイン状態、モデル枠を消費しない残量表示を一覧できます（残量取得の対応は `agy` 1.1.11以降、`codex`、`claude`、`opencode` で、`copilot` は非対応です）。OpenCode Go の残量取得には公式の usage endpoint（`https://opencode.ai/inference/go/v1/usage`）を使用し、`${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json` から `opencode-go` のキーだけを読み取って `opencode.ai` にのみ送信し、保存しません。
+- `aopm status`（または端末上で引数なしの `aopm`）を実行すると、各バックエンドのバージョン、ログイン状態、モデル枠を消費しない残量表示を一覧できます（残量取得の対応は `agy` 1.1.11以降、`codex`、`claude`、`OpenCode Go` で、`copilot` は非対応です）。OpenCode Go の残量取得には `${XDG_DATA_HOME:-~/.local/share}/opencode/auth.json` に保存された `opencode-go` の API キーが必要で、`aopm` はそのキーだけを読み取って公式の usage endpoint（`https://opencode.ai/inference/go/v1/usage`）にのみ送信し、保存しません。
 
 ## License
 

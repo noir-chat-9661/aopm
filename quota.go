@@ -504,7 +504,16 @@ func quotaOpenCode(parent context.Context) ([]quotaMeter, string) {
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, opencodeResponseLimit+1))
-	if err != nil || len(body) > opencodeResponseLimit {
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, "timed out"
+		}
+		if ctx.Err() == context.Canceled {
+			return nil, "cancelled"
+		}
+		return nil, "not available"
+	}
+	if len(body) > opencodeResponseLimit {
 		return nil, "not available"
 	}
 
@@ -552,6 +561,9 @@ func quotaOpenCode(parent context.Context) ([]quotaMeter, string) {
 }
 
 func readOpenCodeGoKey() (string, bool) {
+	if os.Getenv("OPENCODE_AUTH_CONTENT") != "" {
+		return "", false
+	}
 	root := os.Getenv("XDG_DATA_HOME")
 	if !filepath.IsAbs(root) {
 		home, err := os.UserHomeDir()
@@ -560,8 +572,18 @@ func readOpenCodeGoKey() (string, bool) {
 		}
 		root = filepath.Join(home, ".local", "share")
 	}
-	b, err := os.ReadFile(filepath.Join(root, "opencode", "auth.json"))
+	f, err := os.OpenFile(filepath.Join(root, "opencode", "auth.json"), os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", false
+	}
+	const maxAuthSize = 1 << 20
+	b, err := io.ReadAll(io.LimitReader(f, maxAuthSize+1))
+	if err != nil || len(b) > maxAuthSize {
 		return "", false
 	}
 	var auth struct {
@@ -649,12 +671,12 @@ func sanitizeText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-var versionNumRE = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
+var versionNumRE = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?`)
 
 func extractVersion(raw string) string {
 	s := sanitizeText(raw)
 	if m := versionNumRE.FindString(s); m != "" {
-		return m
+		return strings.TrimRight(m, ".")
 	}
 	return s
 }

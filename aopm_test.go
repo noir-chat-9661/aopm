@@ -1053,7 +1053,7 @@ func TestStatusColorsAndBarAndRemaining(t *testing.T) {
 		100: "████████████████████",
 	}
 	for pct, want := range barCases {
-		if got := renderBar(pct, false); got != want {
+		if got := renderBar(pct, 20, false); got != want {
 			t.Fatalf("bar(%d) = %q, want %q", pct, got, want)
 		}
 	}
@@ -1275,4 +1275,204 @@ func TestQuotaMeterOrderWithinGroup(t *testing.T) {
 			t.Fatalf("idx %d = %q, want %q", i, got, want[i])
 		}
 	}
+}
+
+type cancelBodyReader struct {
+	cancel func()
+}
+
+func (r cancelBodyReader) Read([]byte) (int, error) {
+	r.cancel()
+	return 0, context.Canceled
+}
+
+func (r cancelBodyReader) Close() error { return nil }
+
+func TestReviewFixItems(t *testing.T) {
+	// 1 & 2 & 3: auth.json (FIFO/symlink/1MiB), OPENCODE_AUTH_CONTENT, body read cancel
+	t.Run("opencode_auth_safety_and_body_cancel", func(t *testing.T) {
+		oldTransport := opencodeTransport
+		t.Cleanup(func() { opencodeTransport = oldTransport })
+
+		called := false
+		opencodeTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"usage":{"rolling":{"percent":10}}}`)), Header: make(http.Header)}, nil
+		})
+
+		// FIFO で固まらないこと
+		xdg := t.TempDir()
+		authDir := filepath.Join(xdg, "opencode")
+		if err := os.MkdirAll(authDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fifoPath := filepath.Join(authDir, "auth.json")
+		if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("XDG_DATA_HOME", xdg)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if m, r := quota(context.Background(), "opencode", ""); len(m) != 0 || r != "not available" {
+				t.Errorf("fifo: %+v %q", m, r)
+			}
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("FIFO read blocked")
+		}
+		if called {
+			t.Fatal("HTTP called on FIFO")
+		}
+
+		// symlink 先が通常ファイルなら可
+		realFile := filepath.Join(t.TempDir(), "real-auth.json")
+		if err := os.WriteFile(realFile, []byte(`{"opencode-go":{"type":"api","key":"sk-symlink-ok"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.Remove(fifoPath)
+		if err := os.Symlink(realFile, fifoPath); err != nil {
+			t.Fatal(err)
+		}
+		if m, r := quota(context.Background(), "opencode", ""); r != "" || len(m) != 1 || !called {
+			t.Fatalf("symlink regular file failed: %+v %q called=%v", m, r, called)
+		}
+
+		// 1MiB 超は拒否
+		called = false
+		bigAuth := `{"opencode-go":{"type":"api","key":"sk-big"}}` + strings.Repeat(" ", 1<<20)
+		if err := os.WriteFile(realFile, []byte(bigAuth), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if m, r := quota(context.Background(), "opencode", ""); len(m) != 0 || r != "not available" || called {
+			t.Fatalf(">1MiB auth accepted: %+v %q called=%v", m, r, called)
+		}
+
+		// OPENCODE_AUTH_CONTENT が空でなければ通信しない
+		if err := os.WriteFile(realFile, []byte(`{"opencode-go":{"type":"api","key":"sk-ok"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("OPENCODE_AUTH_CONTENT", "{}")
+		if m, r := quota(context.Background(), "opencode", ""); len(m) != 0 || r != "not available" || called {
+			t.Fatalf("OPENCODE_AUTH_CONTENT did not block: %+v %q called=%v", m, r, called)
+		}
+		t.Setenv("OPENCODE_AUTH_CONTENT", "")
+
+		// 本文読み取り中の cancel -> cancelled
+		ctx, cancel := context.WithCancel(context.Background())
+		opencodeTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: cancelBodyReader{cancel: cancel}, Header: make(http.Header)}, nil
+		})
+		if m, r := quota(ctx, "opencode", ""); len(m) != 0 || r != "cancelled" {
+			t.Fatalf("body cancel: %+v %q", m, r)
+		}
+	})
+
+	// 4: 狭い端末幅 (20, 32, 40, 60, 80)
+	t.Run("narrow_terminal_widths", func(t *testing.T) {
+		now := time.Date(2026, 11, 24, 16, 47, 0, 0, time.UTC)
+		statuses := []backendStatus{
+			{
+				Name: "antigravity", Installed: true, VersionDone: true, Version: "1.5.16",
+				AuthDone: true, Auth: "logged in", QuotaDone: true,
+				Meters: []quotaMeter{{Group: "Gemini Models", Window: "5h", Left: 76, Reset: now.Add(32 * time.Minute)}},
+			},
+			{
+				Name: "copilot", Installed: true, VersionDone: true, Version: "1.0.114",
+				AuthDone: true, Auth: "not verified", QuotaDone: true, QuotaReason: "not available",
+			},
+		}
+		for _, w := range []int{20, 32, 40, 60, 80} {
+			for _, ja := range []bool{false, true} {
+				out := renderStatuses(statuses, statusRenderOpts{Now: now, JA: ja, Color: false, Width: w})
+				for _, line := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+					if dw := displayWidth(line); dw > w {
+						t.Fatalf("width=%d ja=%v exceeded (%d): %q", w, ja, dw, line)
+					}
+				}
+			}
+		}
+		// 幅40ではバーが縮むこと、幅32ではバーが省かれて%とリセットが残ること
+		out40 := renderStatuses(statuses, statusRenderOpts{Now: now, JA: true, Width: 40})
+		if !strings.Contains(out40, "█") || strings.Contains(out40, strings.Repeat("█", 15)) {
+			t.Fatalf("width 40 should shrink bar:\n%s", out40)
+		}
+		out32 := renderStatuses(statuses, statusRenderOpts{Now: now, JA: true, Width: 32})
+		if strings.Contains(out32, "█") || !strings.Contains(out32, "76%") || !strings.Contains(out32, "あと 32分") {
+			t.Fatalf("width 32 should omit bar and keep %% + reset:\n%s", out32)
+		}
+	})
+
+	// 5: 端末縮小で前フレームが現在の高さに入らない時はカーソルを戻さない
+	t.Run("terminal_shrink_no_cursor_up", func(t *testing.T) {
+		for _, env := range []string{"AGY_BIN", "CODEX_BIN", "COPILOT_BIN", "CLAUDE_BIN", "OPENCODE_BIN"} {
+			t.Setenv(env, "/nonexistent/missing")
+		}
+		t.Setenv("LC_ALL", "C")
+		t.Setenv("NO_COLOR", "1")
+		calls := 0
+		oldSize := getTerminalSize
+		getTerminalSize = func(io.Writer) (int, int) {
+			calls++
+			if calls == 1 {
+				return 40, 80
+			}
+			return 4, 80
+		}
+		t.Cleanup(func() { getTerminalSize = oldSize })
+
+		var buf bytes.Buffer
+		printAllStatuses(context.Background(), &buf, true)
+		if regexp.MustCompile(`\x1b\[\d+A`).MatchString(buf.String()) {
+			t.Fatalf("cursor-up emitted after shrink:\n%q", buf.String())
+		}
+	})
+
+	// 6: 認証未完了時は残量が先に出ても「…」を表示
+	t.Run("auth_pending_icon", func(t *testing.T) {
+		st := []backendStatus{{
+			Name: "claude", Installed: true, VersionDone: true, Version: "2.1.0",
+			AuthDone: false, Auth: "", QuotaDone: true,
+			Meters: []quotaMeter{{Window: "5h", Left: 80}},
+		}}
+		out := renderStatuses(st, statusRenderOpts{Now: time.Now(), Width: 80})
+		if !strings.Contains(out, "claude    … 2.1.0") {
+			t.Fatalf("expected pending icon …, got:\n%s", out)
+		}
+	})
+
+	// 7: 表示幅（半角カナ=1, 結合文字=0）
+	t.Run("display_width_kana_and_combining", func(t *testing.T) {
+		if got := displayWidth("ｱｲｳ"); got != 3 {
+			t.Fatalf("halfwidth kana width = %d, want 3", got)
+		}
+		if got := displayWidth("｡｢｣"); got != 3 {
+			t.Fatalf("halfwidth punct width = %d, want 3", got)
+		}
+		if got := displayWidth("e\u0301"); got != 1 {
+			t.Fatalf("combining acute width = %d, want 1", got)
+		}
+		if got := displayWidth("か\u3099"); got != 2 {
+			t.Fatalf("combining dakuten width = %d, want 2", got)
+		}
+		if got := displayWidth("a\u20dd"); got != 1 {
+			t.Fatalf("enclosing mark width = %d, want 1", got)
+		}
+	})
+
+	// 8: バージョンプレリリース接尾辞と末尾ドット除去
+	t.Run("extract_version_prerelease", func(t *testing.T) {
+		cases := map[string]string{
+			"GitHub Copilot CLI 1.0.114.": "1.0.114",
+			"codex 0.163.0-rc.1.":         "0.163.0-rc.1",
+			"agy 1.5.16-alpha.2":          "1.5.16-alpha.2",
+		}
+		for in, want := range cases {
+			if got := extractVersion(in); got != want {
+				t.Fatalf("extractVersion(%q) = %q, want %q", in, got, want)
+			}
+		}
+	})
 }

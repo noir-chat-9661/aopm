@@ -69,6 +69,7 @@ type statusRenderOpts struct {
 	Now   time.Time
 	JA    bool
 	Color bool
+	Width int
 }
 
 func isCharDevice(f *os.File) bool {
@@ -152,11 +153,19 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Run with no arguments on a pipe to start the MCP stdio server.")
 }
 
+func renderWidth(live bool, cols int) int {
+	if !live || cols <= 0 || cols > statusMaxWidth {
+		return statusMaxWidth
+	}
+	return cols
+}
+
 func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 	opts := statusRenderOpts{
 		Now:   time.Now(),
 		JA:    isJapaneseLocale(),
 		Color: colorEnabled(live),
+		Width: statusMaxWidth,
 	}
 
 	statuses := make([]backendStatus, len(statusOrder))
@@ -175,14 +184,17 @@ func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 		fetchingLine = " 取得中…"
 	}
 
-	emitFrame := func(frame string) {
+	emitFrame := func() {
 		if compactMode {
 			return
 		}
-		rows, _ := getTerminalSize(w)
+		rows, cols := getTerminalSize(w)
 		if rows <= 0 {
 			rows = 24
 		}
+		opts.Now = time.Now()
+		opts.Width = renderWidth(live, cols)
+		frame := renderStatuses(statuses, opts)
 		lines := strings.Count(frame, "\n")
 		var buf bytes.Buffer
 		if firstWrite {
@@ -191,16 +203,20 @@ func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 		}
 		if lines+1 > rows {
 			compactMode = true
-			if prevLines > 0 {
+			if prevLines > 0 && prevLines+1 <= rows {
 				fmt.Fprintf(&buf, "\x1b[%dA\x1b[J", prevLines)
-				prevLines = 0
+			} else if prevLines > 0 {
+				buf.WriteByte('\n')
 			}
-			buf.WriteString(fetchingLine)
+			prevLines = 0
+			buf.WriteString(truncateWidth(fetchingLine, opts.Width))
 			_, _ = w.Write(buf.Bytes())
 			return
 		}
-		if prevLines > 0 {
+		if prevLines > 0 && prevLines+1 <= rows {
 			fmt.Fprintf(&buf, "\x1b[%dA\x1b[J", prevLines)
+		} else if prevLines > 0 {
+			buf.WriteByte('\n')
 		}
 		buf.WriteString(frame)
 		_, _ = w.Write(buf.Bytes())
@@ -209,7 +225,7 @@ func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 
 	if live {
 		defer func() { _, _ = io.WriteString(w, "\x1b[?7h") }()
-		emitFrame(renderStatuses(statuses, opts))
+		emitFrame()
 	}
 
 	updates := make(chan statusUpdate, len(statusOrder)*3)
@@ -295,8 +311,7 @@ func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 			}
 		}
 		if live {
-			opts.Now = time.Now()
-			emitFrame(renderStatuses(statuses, opts))
+			emitFrame()
 		}
 	}
 
@@ -315,15 +330,18 @@ func printAllStatuses(ctx context.Context, w io.Writer, live bool) {
 				statuses[i].QuotaDone = true
 			}
 		}
-		if live {
-			opts.Now = time.Now()
-			if !compactMode {
-				emitFrame(renderStatuses(statuses, opts))
-			}
+		if live && !compactMode {
+			emitFrame()
 		}
 	}
 
 	opts.Now = time.Now()
+	if live {
+		_, cols := getTerminalSize(w)
+		opts.Width = renderWidth(live, cols)
+	} else {
+		opts.Width = statusMaxWidth
+	}
 	finalFrame := renderStatuses(statuses, opts)
 	if live {
 		if compactMode {
@@ -359,6 +377,10 @@ func renderStatuses(statuses []backendStatus, opts statusRenderOpts) string {
 }
 
 func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) string {
+	maxW := opts.Width
+	if maxW <= 0 || maxW > statusMaxWidth {
+		maxW = statusMaxWidth
+	}
 	name := displayBackendName(st.Name)
 	nameCol := " " + padRightWidth(name, 10)
 
@@ -367,14 +389,21 @@ func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) strin
 		if opts.JA {
 			msg = "取得中…"
 		}
-		return nameCol + msg
+		return truncateWidth(nameCol+msg, maxW)
 	}
 	if !st.Installed {
 		reason := "not-installed"
 		if opts.JA {
 			reason = "未導入"
 		}
-		return nameCol + colorIcon("✕", "\x1b[31m", opts.Color) + " " + reason
+		plain := nameCol + "✕ " + reason
+		if displayWidth(plain) <= maxW {
+			return nameCol + colorIcon("✕", "\x1b[31m", opts.Color) + " " + reason
+		}
+		if avail := maxW - displayWidth(nameCol) - 2; avail > 0 {
+			return nameCol + colorIcon("✕", "\x1b[31m", opts.Color) + " " + truncateWidth(reason, avail)
+		}
+		return truncateWidth(plain, maxW)
 	}
 
 	icon, iconColor, authReason := authDisplay(st.Auth, opts.JA)
@@ -382,22 +411,28 @@ func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) strin
 	if ver == "" {
 		ver = "-"
 	}
+	if availVer := maxW - displayWidth(nameCol) - 2; availVer > 0 && displayWidth(ver) > availVer {
+		ver = truncateWidth(ver, availVer)
+	}
 	headerPlain := nameCol + icon + " " + ver
 	headerColored := nameCol + colorIcon(icon, iconColor, opts.Color) + " " + ver
+	if displayWidth(headerPlain) > maxW {
+		headerPlain = truncateWidth(headerPlain, maxW)
+		headerColored = headerPlain
+	}
 
 	if !st.QuotaDone {
 		msg := "fetching…"
 		if opts.JA {
 			msg = "取得中…"
 		}
-		return headerColored + "\n   " + msg
+		return headerColored + "\n" + truncateWidth("   "+msg, maxW)
 	}
 
 	if len(st.Meters) == 0 {
 		if authReason != "" {
-			maxReason := statusMaxWidth - displayWidth(headerPlain) - 2
-			if maxReason > 0 {
-				return headerColored + "  " + truncateWidth(authReason, maxReason)
+			if displayWidth(headerPlain)+2+displayWidth(authReason) <= maxW {
+				return headerColored + "  " + authReason
 			}
 			return headerColored
 		}
@@ -406,9 +441,11 @@ func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) strin
 		if pad < 2 {
 			pad = 2
 		}
-		maxMsg := statusMaxWidth - displayWidth(headerPlain) - pad
-		if maxMsg > 0 {
-			return headerColored + strings.Repeat(" ", pad) + truncateWidth(msg, maxMsg)
+		if displayWidth(headerPlain)+pad+displayWidth(msg) <= maxW {
+			return headerColored + strings.Repeat(" ", pad) + msg
+		}
+		if availPad := maxW - displayWidth(headerPlain) - displayWidth(msg); availPad >= 2 {
+			return headerColored + strings.Repeat(" ", availPad) + msg
 		}
 		return headerColored
 	}
@@ -422,24 +459,81 @@ func renderBackendBlock(st backendStatus, winW int, opts statusRenderOpts) strin
 			gLabel = translateGroup(m.Group, opts.JA)
 		}
 		prevGroup = m.Group
-		groupCol := padRightWidth(truncateWidth(gLabel, 9), 10)
-		winCol := padRightWidth(truncateWidth(translateWindow(m.Window, opts.JA), winW), winW) + "  "
-		bar := renderBar(m.Left, opts.Color)
-		pctText := fmt.Sprintf("  %3d%%", m.Left)
-		if opts.Color {
-			pctText = colorForLeft(m.Left) + pctText + "\x1b[0m"
-		}
-		line := "   " + groupCol + winCol + bar + pctText
-		prefixW := 3 + 10 + winW + 2 + 20 + 6
-		if rem := formatRemaining(m.Reset, m.ResetText, opts.Now, opts.JA); rem != "" {
-			avail := statusMaxWidth - prefixW - 3
-			if avail > 0 {
-				line += "   " + truncateWidth(rem, avail)
-			}
-		}
-		lines = append(lines, line)
+		lines = append(lines, renderMeterLine(m, gLabel, winW, maxW, opts))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func renderMeterLine(m quotaMeter, gLabel string, winW, maxW int, opts statusRenderOpts) string {
+	groupCol := padRightWidth(truncateWidth(gLabel, 9), 10)
+	winCol := padRightWidth(truncateWidth(translateWindow(m.Window, opts.JA), winW), winW) + "  "
+	leftCol := "   " + groupCol + winCol
+	leftW := displayWidth(leftCol)
+
+	pctPlain := fmt.Sprintf("  %3d%%", m.Left)
+	pctColored := pctPlain
+	if opts.Color {
+		pctColored = colorForLeft(m.Left) + pctPlain + "\x1b[0m"
+	}
+	rem := formatRemaining(m.Reset, m.ResetText, opts.Now, opts.JA)
+	remW := displayWidth(rem)
+
+	if rem != "" {
+		if barW := maxW - leftW - 6 - 3 - remW; barW >= 5 {
+			if barW > 20 {
+				barW = 20
+			}
+			return leftCol + renderBar(m.Left, barW, opts.Color) + pctColored + "   " + rem
+		}
+	} else {
+		if barW := maxW - leftW - 6; barW >= 5 {
+			if barW > 20 {
+				barW = 20
+			}
+			return leftCol + renderBar(m.Left, barW, opts.Color) + pctColored
+		}
+	}
+
+	// バーを省いて残量%とリセットを残す
+	if rem != "" {
+		if leftW+6+3+remW <= maxW {
+			return leftCol + pctColored + "   " + rem
+		}
+		if leftW+6+1+remW <= maxW {
+			return leftCol + pctColored + " " + rem
+		}
+		tightPctPlain := fmt.Sprintf(" %3d%%", m.Left)
+		tightPctColored := tightPctPlain
+		if opts.Color {
+			tightPctColored = colorForLeft(m.Left) + tightPctPlain + "\x1b[0m"
+		}
+		if leftW+5+1+remW <= maxW {
+			return leftCol + tightPctColored + " " + rem
+		}
+	}
+	if leftW+6 <= maxW {
+		return leftCol + pctColored
+	}
+
+	// 極端に狭い端末向け: インデント・グループ幅を詰める
+	cPrefix := " "
+	if gLabel != "" {
+		cPrefix += truncateWidth(gLabel, 6) + " "
+	}
+	cPrefix += translateWindow(m.Window, opts.JA)
+	cPctPlain := fmt.Sprintf(" %3d%%", m.Left)
+	cPctColored := cPctPlain
+	if opts.Color {
+		cPctColored = colorForLeft(m.Left) + cPctPlain + "\x1b[0m"
+	}
+	cBaseW := displayWidth(cPrefix) + displayWidth(cPctPlain)
+	if rem != "" && cBaseW+1+remW <= maxW {
+		return cPrefix + cPctColored + " " + rem
+	}
+	if cBaseW <= maxW {
+		return cPrefix + cPctColored
+	}
+	return truncateWidth(cPrefix+cPctPlain, maxW)
 }
 
 func displayBackendName(backend string) string {
@@ -484,7 +578,9 @@ func authDisplay(auth string, ja bool) (icon, colorCode, reason string) {
 	switch auth {
 	case "logged in":
 		return "●", "\x1b[32m", ""
-	case "not verified", "":
+	case "":
+		return "…", "\x1b[90m", ""
+	case "not verified":
 		return "○", "\x1b[90m", ""
 	case "not logged in":
 		if ja {
@@ -547,27 +643,27 @@ func colorForLeft(left int) string {
 	}
 }
 
-func barFilled(left int) int {
-	if left <= 0 {
+func barFilled(left, width int) int {
+	if width <= 0 || left <= 0 {
 		return 0
 	}
 	if left >= 100 {
-		return 20
+		return width
 	}
-	filled := (left*20 + 50) / 100
+	filled := (left*width + 50) / 100
 	if filled == 0 {
 		return 1
 	}
-	if filled == 20 {
-		return 19
+	if filled == width {
+		return width - 1
 	}
 	return filled
 }
 
-func renderBar(left int, useColor bool) string {
-	filled := barFilled(left)
+func renderBar(left, width int, useColor bool) string {
+	filled := barFilled(left, width)
 	fStr := strings.Repeat("█", filled)
-	eStr := strings.Repeat("░", 20-filled)
+	eStr := strings.Repeat("░", width-filled)
 	if !useColor {
 		return fStr + eStr
 	}
@@ -577,7 +673,7 @@ func renderBar(left int, useColor bool) string {
 		b.WriteString(fStr)
 		b.WriteString("\x1b[0m")
 	}
-	if filled < 20 {
+	if filled < width {
 		b.WriteString("\x1b[90m")
 		b.WriteString(eStr)
 		b.WriteString("\x1b[0m")
@@ -632,10 +728,10 @@ func formatRemaining(reset time.Time, resetText string, now time.Time, ja bool) 
 }
 
 func runeWidth(r rune) int {
-	if r < 0x20 || r == 0x7f {
+	if r < 0x20 || r == 0x7f || unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) {
 		return 0
 	}
-	if r < 0x80 {
+	if r < 0x80 || (r >= 0xFF61 && r <= 0xFF9F) {
 		return 1
 	}
 	if unicode.Is(unicode.Han, r) ||
