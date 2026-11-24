@@ -469,7 +469,8 @@ func runStatus(ctx context.Context, backend, binary string) (string, error) {
 			auth = "no output"
 		}
 	}
-	return fmt.Sprintf("binary: %s\nversion: %s\nauth: %s", binary, version, auth), nil
+	q := quota(ctx, backend, binary)
+	return fmt.Sprintf("binary: %s\nversion: %s\nauth: %s\nquota: %s", binary, version, auth, formatQuotaField(q)), nil
 }
 
 func firstLine(s string) string {
