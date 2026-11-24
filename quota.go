@@ -36,7 +36,7 @@ func quota(ctx context.Context, backend, binary string) string {
 }
 
 func quotaAntigravity(ctx context.Context, binary string) string {
-	r := runCLI(ctx, []string{binary, "-p", "/usage", "--output-format", "json"}, "", nil, nil, quotaTimeout)
+	r := runCLI(ctx, []string{binary, "-p", "/usage", "--output-format", "json"}, os.TempDir(), nil, nil, quotaTimeout)
 	if r.TimedOut {
 		return "timed out"
 	}
@@ -99,15 +99,18 @@ func quotaCodex(parent context.Context, binary string) string {
 	defer cancel()
 
 	cmd := exec.Command(binary, "app-server")
+	cmd.Dir = os.TempDir()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 700 * time.Millisecond
 
-	stdin, err := cmd.StdinPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		return "not available"
 	}
-	stdoutR, stdoutW, err := os.Pipe()
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return "not available"
 	}
 	cmd.Stdout = stdoutW
@@ -150,23 +153,22 @@ func quotaCodex(parent context.Context, binary string) string {
 	}
 	lineCh := make(chan readLine, 16)
 	go func() {
-		br := bufio.NewReader(stdoutR)
-		for {
-			l, err := br.ReadString('\n')
-			if len(l) > 0 {
-				select {
-				case lineCh <- readLine{line: l}:
-				case <-done:
-					return
-				}
-			}
-			if err != nil {
-				select {
-				case lineCh <- readLine{err: err}:
-				case <-done:
-				}
+		sc := bufio.NewScanner(stdoutR)
+		sc.Buffer(make([]byte, 4096), 1<<20)
+		for sc.Scan() {
+			select {
+			case lineCh <- readLine{line: sc.Text()}:
+			case <-done:
 				return
 			}
+		}
+		err := sc.Err()
+		if err == nil {
+			err = io.EOF
+		}
+		select {
+		case lineCh <- readLine{err: err}:
+		case <-done:
 		}
 	}()
 
@@ -294,8 +296,8 @@ func codexWindowLabel(fallback string, mins *int) string {
 var claudeUsageRE = regexp.MustCompile(`^Current\s+([^:]+):\s*([0-9]+(?:\.[0-9]+)?)%\s*used(?:\s*[·•|-]\s*resets\s+(.+))?$`)
 
 func quotaClaude(ctx context.Context, binary string) string {
-	args := []string{binary, "-p", "/usage", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config"}
-	r := runCLI(ctx, args, "", nil, claudeEnv(), quotaTimeout)
+	args := []string{binary, "-p", "/usage", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config", "--settings", `{"disableAllHooks":true}`, "--setting-sources", ""}
+	r := runCLI(ctx, args, os.TempDir(), nil, claudeEnv(), quotaTimeout)
 	if r.TimedOut {
 		return "timed out"
 	}
@@ -425,17 +427,27 @@ type statusUpdate struct {
 	val   string
 }
 
+func isCharDevice(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	if dn, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, dn) {
+		return false
+	}
+	return true
+}
+
 func isLiveTTY(w io.Writer) bool {
 	term := os.Getenv("TERM")
 	if term == "" || term == "dumb" {
 		return false
 	}
 	f, ok := w.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return ok && isCharDevice(f)
 }
 
 func runCLIArgs(args []string, stdinIsTTY, stdoutIsTTY bool, stdout, stderr io.Writer) (handled bool, exitCode int) {
@@ -651,15 +663,7 @@ func summarizeAuth(ctx context.Context, backend, binary string) string {
 			return fmt.Sprintf("command exited %d", r.ExitCode)
 		}
 		return "not logged in"
-	case "codex":
-		if text := sanitizeText(firstLine(r.Stdout + "\n" + r.Stderr)); text != "" && text != "(no version output)" {
-			return text
-		}
-		if r.ExitCode != 0 {
-			return fmt.Sprintf("command exited %d", r.ExitCode)
-		}
-		return "not verified"
-	case "claude":
+	case "claude", "codex":
 		if r.ExitCode == 0 {
 			return "logged in"
 		}

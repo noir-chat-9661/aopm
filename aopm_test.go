@@ -761,3 +761,95 @@ exit 0
 		t.Fatalf("expected cancelled in final frame on cancel:\n%s", cFrames[len(cFrames)-2])
 	}
 }
+
+func TestReviewFixes(t *testing.T) {
+	// 1. quotaClaude が --settings {"disableAllHooks":true} --setting-sources "" を渡すこと
+	bin := fakeBinary(t)
+	logPath := filepath.Join(t.TempDir(), "claude-argv")
+	t.Setenv("FAKE_LOG", logPath)
+	t.Setenv("FAKE_KIND", "claude")
+	t.Setenv("FAKE_CLAUDE_QUOTA", `{"type":"result","result":"Current session: 10% used"}`)
+	if got := quota(context.Background(), "claude", bin); got != "5h 90% left" {
+		t.Fatalf("claude quota: %q", got)
+	}
+	argvBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := string(argvBytes)
+	if !strings.Contains(argv, "--settings\n{\"disableAllHooks\":true}\n--setting-sources\n\n") {
+		t.Fatalf("claude quota missing hook-disable flags:\n%s", argv)
+	}
+
+	// 3. codex login status の生出力(マスク済みAPIキー等)を出さず exit 0/非0 のみで判定すること
+	codexScript := `#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'codex 1.0\n'; exit 0; fi
+if [ "$1" = "login" ]; then
+	printf 'Logged in using API key sk-proj-MASKEDSECRET\n'
+	exit "${FAKE_CODEX_EXIT:-0}"
+fi
+exit 0
+`
+	codexBin := filepath.Join(t.TempDir(), "codex-auth-cli")
+	if err := os.WriteFile(codexBin, []byte(codexScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_CODEX_EXIT", "0")
+	stOut, err := runStatus(context.Background(), "codex", codexBin)
+	if err != nil || !strings.Contains(stOut, "auth: logged in") || strings.Contains(stOut, "MASKEDSECRET") {
+		t.Fatalf("codex runStatus exit 0: %q, %v", stOut, err)
+	}
+	if auth := summarizeAuth(context.Background(), "codex", codexBin); auth != "logged in" {
+		t.Fatalf("codex summarizeAuth exit 0: %q", auth)
+	}
+	t.Setenv("FAKE_CODEX_EXIT", "1")
+	stOut, err = runStatus(context.Background(), "codex", codexBin)
+	if err != nil || !strings.Contains(stOut, "auth: not logged in") || strings.Contains(stOut, "MASKEDSECRET") {
+		t.Fatalf("codex runStatus exit 1: %q, %v", stOut, err)
+	}
+	if auth := summarizeAuth(context.Background(), "codex", codexBin); auth != "not logged in" {
+		t.Fatalf("codex summarizeAuth exit 1: %q", auth)
+	}
+
+	// 4. codex app-server の 1 MiB 超行で "not available" になりプロセスが残らないこと
+	bigPID := filepath.Join(t.TempDir(), "big-codex-pid")
+	bigScript := fmt.Sprintf(`#!/bin/sh
+echo $$ > %q
+head -c 1048577 /dev/zero | tr '\0' 'a'
+printf '\n'
+sleep 30
+`, bigPID)
+	bigBin := filepath.Join(t.TempDir(), "codex-big-cli")
+	if err := os.WriteFile(bigBin, []byte(bigScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if got := quota(context.Background(), "codex", bigBin); got != "not available" {
+		t.Fatalf("expected not available on >1MiB line, got %q", got)
+	}
+	data, err := os.ReadFile(bigPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	_, _ = fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &pid)
+	if pid > 0 && syscall.Kill(pid, 0) == nil {
+		state, _ := exec.Command("ps", "-o", "state=", "-p", fmt.Sprint(pid)).Output()
+		if st := strings.TrimSpace(string(state)); st != "" && !strings.HasPrefix(st, "Z") {
+			t.Fatalf("big codex app-server still alive: %d (%s)", pid, state)
+		}
+	}
+
+	// 6. /dev/null は isCharDevice で false になり MCP サーバー扱いになること
+	dn, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dn.Close() }()
+	if isCharDevice(dn) {
+		t.Fatal("/dev/null must not be treated as a terminal")
+	}
+	var out, errOut bytes.Buffer
+	if handled, code := runCLIArgs([]string{"aopm"}, isCharDevice(dn), false, &out, &errOut); handled || code != 0 {
+		t.Fatalf("/dev/null should not trigger CLI status: handled=%v code=%d", handled, code)
+	}
+}

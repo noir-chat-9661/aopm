@@ -57,9 +57,7 @@ func newServer() *server {
 }
 
 func main() {
-	fi, err := os.Stdin.Stat()
-	stdinIsTTY := err == nil && fi.Mode()&os.ModeCharDevice != 0
-	if handled, code := runCLIArgs(os.Args, stdinIsTTY, isLiveTTY(os.Stdout), os.Stdout, os.Stderr); handled {
+	if handled, code := runCLIArgs(os.Args, isCharDevice(os.Stdin), isLiveTTY(os.Stdout), os.Stdout, os.Stderr); handled {
 		if code != 0 {
 			os.Exit(code)
 		}
