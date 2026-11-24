@@ -367,6 +367,9 @@ func TestAntigravityPolicy(t *testing.T) {
 			t.Fatalf("%q %v", answer, err)
 		}
 	}
+	if p, _, err := loadSession("antigravity", ws); err != nil || p.Sandbox != "read-only" {
+		t.Fatalf("plan pin: %+v %v", p, err)
+	}
 	argv, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)

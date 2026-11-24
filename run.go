@@ -299,9 +299,6 @@ func runAntigravity(ctx context.Context, o runOptions) (backendResult, error) {
 	if o.Plan && strings.HasPrefix(first, "/") && !strings.Contains(first[1:], "/") {
 		return backendResult{}, fmt.Errorf("plan mode refuses slash-command prompts")
 	}
-	if o.Plan {
-		o.Sandbox = "read-only"
-	}
 	args := []string{o.Binary, "--print-timeout", fmt.Sprintf("%ds", o.Timeout), "--sandbox", "--settings", antigravitySettings(o.Sandbox)}
 	if o.Plan {
 		args = append(args, "--mode", "plan")

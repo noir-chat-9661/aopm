@@ -389,6 +389,9 @@ func executeTool(ctx context.Context, name string, raw json.RawMessage) (string,
 	if a.Sandbox != nil {
 		sandbox = *a.Sandbox
 	}
+	if a.Plan {
+		sandbox = "read-only"
+	}
 	bin, err := resolveBackendBinary(backend)
 	if err != nil {
 		return "", err
